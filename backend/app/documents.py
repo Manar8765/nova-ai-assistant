@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import os
+from io import BytesIO
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Literal
 from uuid import UUID, uuid4
+from zipfile import BadZipFile, ZipFile
 
 from dotenv import load_dotenv
 from fastapi import APIRouter, Depends, File, Header, HTTPException, Response, UploadFile, status
@@ -63,7 +65,7 @@ def get_supabase_client() -> Client:
     return create_client(supabase_url, service_role_key)
 
 
-def validate_upload_metadata(filename: str | None, file_size: int) -> tuple[str, str, str]:
+def validate_upload_metadata(filename: str | None, content: bytes) -> tuple[str, str, str]:
     safe_filename = Path((filename or "").replace("\\", "/")).name
     extension = Path(safe_filename).suffix.lower()
 
@@ -73,14 +75,44 @@ def validate_upload_metadata(filename: str | None, file_size: int) -> tuple[str,
             detail="Unsupported file type. Upload a PDF, TXT, or DOCX file.",
         )
 
-    if file_size > MAX_FILE_SIZE:
+    if len(content) > MAX_FILE_SIZE:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail="File size must not exceed 10 MB.",
         )
 
     file_type, content_type = SUPPORTED_TYPES[extension]
+    if not _content_matches_type(file_type, content):
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="File content does not match the selected PDF, TXT, or DOCX type.",
+        )
+
     return safe_filename, file_type, content_type
+
+
+def _content_matches_type(file_type: str, content: bytes) -> bool:
+    if file_type == "PDF":
+        return content.startswith(b"%PDF-")
+
+    if file_type == "TXT":
+        if b"\x00" in content:
+            return False
+        try:
+            content.decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+        return True
+
+    if file_type == "DOCX":
+        try:
+            with ZipFile(BytesIO(content)) as archive:
+                names = set(archive.namelist())
+        except (BadZipFile, OSError):
+            return False
+        return "[Content_Types].xml" in names and "word/document.xml" in names
+
+    return False
 
 
 def _extract_bearer_token(authorization: str | None) -> str:
@@ -219,7 +251,7 @@ async def create_document(
     client: Annotated[Client, Depends(get_supabase_client)],
 ) -> dict:
     content = await file.read(MAX_FILE_SIZE + 1)
-    filename, file_type, content_type = validate_upload_metadata(file.filename, len(content))
+    filename, file_type, content_type = validate_upload_metadata(file.filename, content)
     document_id = uuid4()
     path = _storage_path(profile.company_id, document_id, filename)
 
@@ -290,7 +322,7 @@ async def replace_document(
 ) -> dict:
     existing = _get_document_or_404(client, document_id, profile.company_id)
     content = await file.read(MAX_FILE_SIZE + 1)
-    filename, file_type, content_type = validate_upload_metadata(file.filename, len(content))
+    filename, file_type, content_type = validate_upload_metadata(file.filename, content)
     new_path = _storage_path(profile.company_id, document_id, filename)
     old_path = existing["file_path"]
     old_content = _download_file(client, old_path) if new_path == old_path else None

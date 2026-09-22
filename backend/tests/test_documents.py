@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from io import BytesIO
+from zipfile import ZipFile
 
 import pytest
 from fastapi import HTTPException
@@ -88,38 +90,61 @@ def client():
 
 def test_validate_upload_metadata_rejects_unsupported_file_type():
     with pytest.raises(HTTPException) as exc_info:
-        validate_upload_metadata("document.exe", 10)
+        validate_upload_metadata("document.exe", b"content")
 
     assert exc_info.value.status_code == 415
 
 
 def test_validate_upload_metadata_rejects_files_larger_than_ten_megabytes():
     with pytest.raises(HTTPException) as exc_info:
-        validate_upload_metadata("document.pdf", MAX_FILE_SIZE + 1)
+        validate_upload_metadata("document.pdf", b"%PDF-1.7" + b"x" * MAX_FILE_SIZE)
 
     assert exc_info.value.status_code == 413
 
 
 @pytest.mark.parametrize(
-    ("filename", "expected_type", "expected_content_type"),
+    ("filename", "content", "expected_type", "expected_content_type"),
     [
-        ("plan.pdf", "PDF", "application/pdf"),
-        ("notes.TXT", "TXT", "text/plain"),
+        ("plan.pdf", b"%PDF-1.7\n", "PDF", "application/pdf"),
+        ("notes.TXT", b"Plain UTF-8 text", "TXT", "text/plain"),
         (
             "proposal.docx",
+            None,
             "DOCX",
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         ),
     ],
 )
 def test_validate_upload_metadata_accepts_supported_file_types(
-    filename, expected_type, expected_content_type
+    filename, content, expected_type, expected_content_type
 ):
-    safe_filename, file_type, content_type = validate_upload_metadata(filename, 1)
+    if content is None:
+        buffer = BytesIO()
+        with ZipFile(buffer, "w") as archive:
+            archive.writestr("[Content_Types].xml", "<Types />")
+            archive.writestr("word/document.xml", "<w:document />")
+        content = buffer.getvalue()
+
+    safe_filename, file_type, content_type = validate_upload_metadata(filename, content)
 
     assert safe_filename == filename
     assert file_type == expected_type
     assert content_type == expected_content_type
+
+
+@pytest.mark.parametrize(
+    ("filename", "content"),
+    [
+        ("document.pdf", b"not a PDF"),
+        ("notes.txt", b"\xff\xfe\x00"),
+        ("proposal.docx", b"not a DOCX archive"),
+    ],
+)
+def test_validate_upload_metadata_rejects_content_that_does_not_match_extension(filename, content):
+    with pytest.raises(HTTPException) as exc_info:
+        validate_upload_metadata(filename, content)
+
+    assert exc_info.value.status_code == 415
 
 
 def test_storage_path_is_company_and_document_scoped():
