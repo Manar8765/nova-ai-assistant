@@ -1,4 +1,5 @@
 import { redirect } from "next/navigation";
+import Link from "next/link";
 import { createClient } from "../../lib/supabase/server";
 import { LogoutButton } from "./logout-button";
 
@@ -50,6 +51,9 @@ export default async function DashboardPage() {
           </div>
         )}
       </section>
+      <p>
+        <Link href="/documents">Manage documents</Link>
+      </p>
       <LogoutButton />
     </main>
   );
