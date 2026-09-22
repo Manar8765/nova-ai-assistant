@@ -12,9 +12,22 @@ export async function GET(request: NextRequest) {
 
   if (tokenHash && type) {
     const supabase = await createClient();
-    const { error } = await supabase.auth.verifyOtp({ token_hash: tokenHash, type });
+    const { data, error } = await supabase.auth.verifyOtp({ token_hash: tokenHash, type });
 
     if (!error) {
+      const companyName = String(data.user?.user_metadata.company_name ?? "");
+      const fullName = String(data.user?.user_metadata.full_name ?? "");
+      const { error: onboardingError } = await supabase.rpc("create_company_admin", {
+        p_company_name: companyName,
+        p_full_name: fullName
+      });
+
+      if (!onboardingError) {
+        return NextResponse.redirect(redirectUrl);
+      }
+
+      redirectUrl.pathname = "/login";
+      redirectUrl.searchParams.set("error", "onboarding_failed");
       return NextResponse.redirect(redirectUrl);
     }
   }

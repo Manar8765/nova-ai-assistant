@@ -9,6 +9,8 @@ export default async function LoginPage({ searchParams }: LoginPageProps) {
   const initialError =
     error === "confirmation_failed"
       ? "We could not confirm your email. Request a new confirmation link and try again."
+      : error === "onboarding_failed"
+        ? "Your email was confirmed, but company setup could not be completed. Sign in to retry."
       : undefined;
 
   return <AuthForm mode="sign-in" initialError={initialError} />;
