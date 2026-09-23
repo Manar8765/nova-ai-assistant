@@ -1,4 +1,4 @@
-"""Text extraction, deterministic chunking, and document processing lifecycle."""
+"""Text extraction, deterministic chunking, embeddings, and document processing lifecycle."""
 
 from __future__ import annotations
 
@@ -9,6 +9,8 @@ from typing import Any
 from docx import Document
 from pypdf import PdfReader
 from supabase import Client
+
+from app.embeddings import EmbeddingError, format_embedding_for_database, generate_embedding
 
 DOCUMENT_BUCKET = "documents"
 CHUNK_SIZE = 1000
@@ -93,6 +95,23 @@ def chunk_text(text: str, *, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_
     return chunks
 
 
+def embed_chunks(chunks: list[str]) -> list[dict[str, Any]]:
+    """Pair every chunk with its own embedding before anything is persisted.
+
+    READY means every chunk carries an embedding, so one failing embed aborts the whole
+    batch and the document lifecycle stores a safe failure reason instead.
+    """
+    embedded: list[dict[str, Any]] = []
+    for index, chunk in enumerate(chunks):
+        try:
+            embedding = format_embedding_for_database(generate_embedding(chunk))
+        except EmbeddingError as exc:
+            logger.error("Embedding generation failed for chunk_index=%s.", index)
+            raise DocumentProcessingError(exc.reason) from exc
+        embedded.append({"chunk_index": index, "content": chunk, "embedding": embedding})
+    return embedded
+
+
 def _get_document(client: Client, document_id: str, company_id: str) -> dict[str, Any] | None:
     response = (
         client.table("document")
@@ -146,9 +165,8 @@ def _replace_chunks(
     company_id: str,
     file_path: str,
     processing_generation: int,
-    chunks: list[str],
+    chunks: list[dict[str, Any]],
 ) -> bool:
-    payload = [{"chunk_index": index, "content": chunk} for index, chunk in enumerate(chunks)]
     response = client.rpc(
         "replace_document_chunks_for_generation",
         {
@@ -156,7 +174,7 @@ def _replace_chunks(
             "p_company_id": company_id,
             "p_file_path": file_path,
             "p_processing_generation": processing_generation,
-            "p_chunks": payload,
+            "p_chunks": chunks,
         },
     ).execute()
     return bool(response.data)
@@ -185,7 +203,12 @@ def process_document(
         chunks = chunk_text(extract_text(document["file_type"], content))
         if not chunks:
             raise DocumentProcessingError(NO_TEXT_REASON)
-        if not _replace_chunks(client, document_id, company_id, expected_file_path, processing_generation, chunks):
+        # Embeddings are generated for every chunk before the chunk set is persisted, so the
+        # document never reaches READY with a chunk that has no embedding.
+        embedded_chunks = embed_chunks(chunks)
+        if not _replace_chunks(
+            client, document_id, company_id, expected_file_path, processing_generation, embedded_chunks
+        ):
             return
         _set_status(client, document_id, company_id, expected_file_path, processing_generation, "READY")
     except DocumentProcessingError as exc:

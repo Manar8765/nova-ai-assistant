@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import hashlib
 from io import BytesIO
 from pathlib import Path
 
 import pytest
 from docx import Document
+from google.genai import types
 
+from app import embeddings
 from app.document_processing import (
     CHUNK_OVERLAP,
     CHUNK_SIZE,
@@ -14,11 +17,19 @@ from app.document_processing import (
     TEMPORARY_REASON,
     UTF8_REASON,
     chunk_text,
+    embed_chunks,
     extract_docx_text,
     extract_pdf_text,
     extract_text,
     extract_txt_text,
     process_document,
+)
+from app.embeddings import (
+    EMBEDDING_DIMENSIONS,
+    EMBEDDING_MODEL,
+    EMBEDDING_REASON,
+    EmbeddingError,
+    format_embedding_for_database,
 )
 
 
@@ -104,6 +115,49 @@ def test_chunking_is_deterministic_and_handles_short_and_large_text():
     assert chunks[1][-CHUNK_OVERLAP:] == chunks[2][:CHUNK_OVERLAP]
 
 
+def _chunk_vector(text: str) -> list[float]:
+    """Deterministic stand-in for a Gemini embedding so stored vectors can be compared."""
+    digest = hashlib.sha256(text.encode("utf-8")).digest()
+    return [round(digest[index % len(digest)] / 255, 6) for index in range(EMBEDDING_DIMENSIONS)]
+
+
+class FakeEmbeddingModels:
+    def __init__(self, vector_builder, failure_trigger):
+        self.vector_builder = vector_builder
+        self.failure_trigger = failure_trigger
+        self.calls: list[str] = []
+
+    def embed_content(self, *, model, contents, config):
+        assert model == EMBEDDING_MODEL
+        assert config.output_dimensionality == EMBEDDING_DIMENSIONS
+        index = len(self.calls)
+        self.calls.append(contents)
+        failure = self.failure_trigger(index, contents) if self.failure_trigger else None
+        if failure is not None:
+            raise failure
+        return types.EmbedContentResponse(
+            embeddings=[types.ContentEmbedding(values=self.vector_builder(contents))]
+        )
+
+
+class FakeGeminiClient:
+    def __init__(self, models):
+        self.models = models
+
+
+@pytest.fixture(autouse=True)
+def fake_gemini(monkeypatch):
+    """Embedding calls always go to a deterministic fake instead of the Gemini API."""
+
+    def _install(vector_builder=_chunk_vector, failure_trigger=None):
+        client = FakeGeminiClient(FakeEmbeddingModels(vector_builder, failure_trigger))
+        monkeypatch.setattr(embeddings, "get_gemini_client", lambda: client)
+        return client
+
+    _install()
+    return _install
+
+
 class FakeResponse:
     def __init__(self, data=None):
         self.data = data
@@ -161,6 +215,8 @@ class FakeQuery:
             if self.operation == "select":
                 return FakeResponse(document.copy())
             document.update(self.values)
+            if "status" in self.values:
+                self.client.status_history.append(document["status"])
             return FakeResponse([document.copy()])
 
         if self.operation == "delete":
@@ -189,6 +245,7 @@ class FakeRpc:
             ):
                 return FakeResponse(False)
             document.update({"status": "PROCESSING", "failure_reason": None})
+            self.client.status_history.append("PROCESSING")
             self.client.chunks = []
             return FakeResponse(True)
 
@@ -199,6 +256,10 @@ class FakeRpc:
             or document["processing_generation"] != self.params["p_processing_generation"]
         ):
             return FakeResponse(False)
+        # Mirrors the Phase 5 guard: a document may only be persisted with complete embeddings.
+        if any(not chunk.get("embedding") for chunk in self.params["p_chunks"]):
+            raise RuntimeError("Every document chunk must include an embedding")
+
         self.client.chunks = [
             chunk
             for chunk in self.client.chunks
@@ -227,6 +288,7 @@ class FakeProcessingClient:
             "failure_reason": None,
         }
         self.chunks = []
+        self.status_history = ["UPLOADED"]
         self.storage = FakeStorage({self.document["file_path"]: content})
 
     def table(self, table_name):
@@ -359,3 +421,231 @@ def test_replace_route_uses_atomic_metadata_and_chunk_invalidation_rpc():
     assert "_replace_document_metadata_and_clear_chunks(" in source
     assert '"replace_document_metadata_and_clear_chunks"' in source
     assert "clear_document_chunks" not in source
+
+
+def test_embed_chunks_pairs_every_chunk_with_its_own_embedding(fake_gemini):
+    gemini = fake_gemini()
+
+    embedded = embed_chunks(["first chunk", "second chunk"])
+
+    assert [item["chunk_index"] for item in embedded] == [0, 1]
+    assert [item["content"] for item in embedded] == ["first chunk", "second chunk"]
+    assert gemini.models.calls == ["first chunk", "second chunk"]
+    assert embedded[0]["embedding"] == format_embedding_for_database(_chunk_vector("first chunk"))
+    assert embedded[1]["embedding"] == format_embedding_for_database(_chunk_vector("second chunk"))
+    assert embedded[0]["embedding"] != embedded[1]["embedding"]
+
+
+def test_embed_chunks_turns_a_provider_failure_into_a_safe_processing_error(fake_gemini):
+    fake_gemini(failure_trigger=lambda _index, _text: RuntimeError("provider url https://internal.example"))
+
+    with pytest.raises(DocumentProcessingError) as exc_info:
+        embed_chunks(["chunk"])
+
+    assert exc_info.value.reason == EMBEDDING_REASON
+    assert "internal.example" not in exc_info.value.reason
+
+
+def test_successful_processing_persists_one_embedding_per_chunk():
+    client = FakeProcessingClient(b"A" * (CHUNK_SIZE + 100))
+
+    process_document(client, "document-1", "company-1", client.document["file_path"], 0)
+
+    assert client.document["status"] == "READY"
+    assert client.document["failure_reason"] is None
+    assert client.status_history == ["UPLOADED", "PROCESSING", "READY"]
+    assert [chunk["chunk_index"] for chunk in client.chunks] == [0, 1]
+    for chunk in client.chunks:
+        assert chunk["embedding"] == format_embedding_for_database(_chunk_vector(chunk["content"]))
+
+
+def test_multiple_chunks_receive_their_own_distinct_embedding(fake_gemini):
+    gemini = fake_gemini()
+    content = "".join(f"section {index:02d} " + "z" * 60 + "\n" for index in range(40))
+    client = FakeProcessingClient(content.encode("utf-8"))
+
+    process_document(client, "document-1", "company-1", client.document["file_path"], 0)
+
+    assert client.document["status"] == "READY"
+    assert len(client.chunks) >= 3
+    assert gemini.models.calls == [chunk["content"] for chunk in client.chunks]
+    stored_embeddings = [chunk["embedding"] for chunk in client.chunks]
+    assert len(set(stored_embeddings)) == len(stored_embeddings)
+    for chunk in client.chunks:
+        assert chunk["embedding"] == format_embedding_for_database(_chunk_vector(chunk["content"]))
+
+
+def test_one_failed_embedding_keeps_the_document_failed_and_persists_no_chunks(fake_gemini):
+    gemini = fake_gemini(
+        failure_trigger=lambda index, _text: RuntimeError("provider unavailable") if index == 2 else None
+    )
+    content = "".join(f"section {index:02d} " + "z" * 60 + "\n" for index in range(40))
+    client = FakeProcessingClient(content.encode("utf-8"))
+
+    process_document(client, "document-1", "company-1", client.document["file_path"], 0)
+
+    assert len(gemini.models.calls) == 3
+    assert client.document["status"] == "FAILED"
+    assert client.document["failure_reason"] == EMBEDDING_REASON
+    assert client.status_history == ["UPLOADED", "PROCESSING", "FAILED"]
+    assert client.chunks == []
+
+
+def test_invalid_embedding_dimensions_fail_safely(fake_gemini):
+    fake_gemini(vector_builder=lambda _text: _chunk_vector("short vector")[:512])
+    client = FakeProcessingClient()
+
+    process_document(client, "document-1", "company-1", client.document["file_path"], 0)
+
+    assert client.document["status"] == "FAILED"
+    assert client.document["failure_reason"] == EMBEDDING_REASON
+    assert "512" not in client.document["failure_reason"]
+    assert client.chunks == []
+
+
+def test_missing_api_key_fails_the_document_with_a_safe_reason(fake_gemini):
+    fake_gemini(failure_trigger=lambda _index, _text: EmbeddingError(EMBEDDING_REASON))
+    client = FakeProcessingClient()
+
+    process_document(client, "document-1", "company-1", client.document["file_path"], 0)
+
+    assert client.document["status"] == "FAILED"
+    assert client.document["failure_reason"] == EMBEDDING_REASON
+    assert "GEMINI_API_KEY" not in client.document["failure_reason"]
+    assert client.chunks == []
+
+
+def test_embedding_network_failure_exposes_no_technical_details(fake_gemini):
+    fake_gemini(failure_trigger=lambda _index, _text: ConnectionError("dial tcp 10.0.0.5:443 refused"))
+    client = FakeProcessingClient()
+
+    process_document(client, "document-1", "company-1", client.document["file_path"], 0)
+
+    reason = client.document["failure_reason"]
+    assert client.document["status"] == "FAILED"
+    assert reason == EMBEDDING_REASON
+    assert "10.0.0.5" not in reason
+    assert "ConnectionError" not in reason
+    assert "443" not in reason
+
+
+def test_arabic_chunk_text_is_embedded_normally(fake_gemini):
+    gemini = fake_gemini()
+    client = FakeProcessingClient(("محتوى عربي للاختبار " * 80).encode("utf-8"))
+
+    process_document(client, "document-1", "company-1", client.document["file_path"], 0)
+
+    assert client.document["status"] == "READY"
+    assert len(client.chunks) >= 2
+    assert all("محتوى عربي" in call for call in gemini.models.calls)
+    for chunk in client.chunks:
+        assert chunk["embedding"] == format_embedding_for_database(_chunk_vector(chunk["content"]))
+        assert len(chunk["embedding"].strip("[]").split(",")) == EMBEDDING_DIMENSIONS
+
+
+def test_replacement_persists_new_embeddings_without_mixing_old_ones():
+    client = FakeProcessingClient(b"old content")
+    process_document(client, "document-1", "company-1", client.document["file_path"], 0)
+    old_embeddings = [chunk["embedding"] for chunk in client.chunks]
+    assert old_embeddings
+
+    client.document["file_path"] = "documents/company-1/document-1/replacement.txt"
+    client.document.update({"status": "UPLOADED", "processing_generation": 1})
+    client.storage.bucket.objects[client.document["file_path"]] = b"new replacement content"
+
+    process_document(client, "document-1", "company-1", client.document["file_path"], 1)
+
+    assert client.document["status"] == "READY"
+    assert [chunk["content"] for chunk in client.chunks] == ["new replacement content"]
+    new_embeddings = [chunk["embedding"] for chunk in client.chunks]
+    assert new_embeddings == [format_embedding_for_database(_chunk_vector("new replacement content"))]
+    assert set(new_embeddings).isdisjoint(old_embeddings)
+
+
+def test_failed_replacement_leaves_no_stale_embeddings(fake_gemini):
+    client = FakeProcessingClient(b"old content")
+    process_document(client, "document-1", "company-1", client.document["file_path"], 0)
+    assert [chunk["embedding"] for chunk in client.chunks]
+
+    client.document["file_path"] = "documents/company-1/document-1/replacement.txt"
+    client.document.update({"status": "UPLOADED", "processing_generation": 1})
+    client.storage.bucket.objects[client.document["file_path"]] = b"new replacement content"
+    fake_gemini(failure_trigger=lambda _index, _text: RuntimeError("provider unavailable"))
+
+    process_document(client, "document-1", "company-1", client.document["file_path"], 1)
+
+    assert client.document["status"] == "FAILED"
+    assert client.document["failure_reason"] == EMBEDDING_REASON
+    assert client.chunks == []
+
+
+def test_stale_processing_cannot_write_embeddings_for_a_newer_generation():
+    client = FakeProcessingClient(b"version A")
+    process_document(client, "document-1", "company-1", client.document["file_path"], 0)
+    assert [chunk["embedding"] for chunk in client.chunks]
+
+    client.document.update({"status": "UPLOADED", "processing_generation": 1, "failure_reason": None})
+    client.chunks = []
+    client.storage.bucket.objects[client.document["file_path"]] = b"version B"
+
+    process_document(client, "document-1", "company-1", client.document["file_path"], 0)
+
+    assert client.document["status"] == "UPLOADED"
+    assert client.chunks == []
+
+    process_document(client, "document-1", "company-1", client.document["file_path"], 1)
+
+    assert [chunk["content"] for chunk in client.chunks] == ["version B"]
+    assert [chunk["embedding"] for chunk in client.chunks] == [
+        format_embedding_for_database(_chunk_vector("version B"))
+    ]
+
+
+def test_embeddings_follow_the_same_tenant_isolation_as_chunks(fake_gemini):
+    gemini = fake_gemini()
+    existing = {
+        "document_id": "document-1",
+        "company_id": "company-1",
+        "chunk_index": 0,
+        "content": "existing",
+        "embedding": format_embedding_for_database(_chunk_vector("existing")),
+    }
+    client = FakeProcessingClient()
+    client.chunks = [existing]
+
+    process_document(client, "document-1", "company-2", client.document["file_path"], 0)
+
+    assert client.document["status"] == "UPLOADED"
+    assert client.chunks == [existing]
+    assert gemini.models.calls == []
+
+
+def test_embedding_migration_adds_a_nullable_768_dimension_column_without_a_search_index():
+    migration = Path(__file__).parents[2] / "supabase/migrations/20260923120000_add_document_chunk_embeddings.sql"
+    sql = migration.read_text(encoding="utf-8")
+
+    assert "create extension if not exists vector" in sql
+    assert "add column embedding vector(768)" in sql
+    assert "embedding vector(768) not null" not in sql
+    assert "embedding vector(768) default" not in sql
+    assert "(chunk.value ->> 'embedding')::vector" in sql
+    assert "every document chunk must include an embedding" in sql.lower()
+    assert "replace_document_chunks_for_generation" in sql
+    assert "processing_generation = p_processing_generation" in sql
+
+    # Retrieval and its index belong to a later phase, and no existing column, policy, or
+    # tenant-scoped read grant may be removed.
+    assert "hnsw" not in sql.lower()
+    assert "ivfflat" not in sql.lower()
+    assert "drop column" not in sql.lower()
+    assert "drop policy" not in sql.lower()
+    assert "revoke select on table public.document_chunk" not in sql
+
+
+def test_processing_generates_embeddings_before_the_document_becomes_ready():
+    source = (Path(__file__).parents[1] / "app/document_processing.py").read_text(encoding="utf-8")
+
+    assert "embed_chunks(chunks)" in source
+    assert '"embedding": embedding' in source
+    assert "replace_document_chunks_for_generation" in source
+    assert source.index("embed_chunks(chunks)") < source.index('"READY"')
