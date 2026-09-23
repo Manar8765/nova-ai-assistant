@@ -10,6 +10,7 @@ type DocumentRecord = {
   file_type: "PDF" | "TXT" | "DOCX";
   file_size: number;
   status: "UPLOADED" | "PROCESSING" | "READY" | "FAILED";
+  failure_reason: string | null;
 };
 
 const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
@@ -202,7 +203,15 @@ export function DocumentsManager() {
                 <td>{document.filename}</td>
                 <td>{document.file_type}</td>
                 <td>{formatFileSize(document.file_size)}</td>
-                <td>{document.status}</td>
+                <td>
+                  {document.status}
+                  {document.status === "FAILED" && document.failure_reason ? (
+                    <>
+                      <br />
+                      Reason: {document.failure_reason}
+                    </>
+                  ) : null}
+                </td>
                 <td>
                   <label htmlFor={`replace-${document.document_id}`}>Replace</label>{" "}
                   <input
