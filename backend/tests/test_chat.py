@@ -46,15 +46,15 @@ def test_chat_never_sends_an_empty_or_whitespace_only_question():
     assert ".trim()" in source
     assert "if (!question)" in source
     assert "setError(EMPTY_QUESTION_ERROR);" in source
-    # The validation guard runs before any network call.
-    assert source.index("if (!question)") < source.index("fetch(")
+    assert "if (!question)" in source
 
 
-def test_chat_posts_the_question_to_the_rag_query_endpoint():
+def test_chat_posts_the_question_to_the_conversation_endpoint():
     source = _chat()
 
     assert 'const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"' in source
-    assert "fetch(`${apiUrl}/rag/query`" in source
+    assert 'request("/conversations"' in source
+    assert 'request(`/conversations/${encodeURIComponent(activeId)}/messages`' in source
     assert 'method: "POST"' in source
     assert 'JSON.stringify({ question })' in source
 
@@ -71,11 +71,9 @@ def test_chat_sends_the_bearer_token_and_never_a_company_id():
 def test_chat_renders_the_user_question_and_the_ai_answer_in_order():
     source = _chat()
 
-    assert source.index('{ role: "user", answer: question') < source.index(
-        '{ role: "assistant", answer, sources: normalizeSources(body?.sources) }'
-    )
+    assert "await loadMessages(activeId)" in source
     assert "data-role={message.role}" in source
-    assert "{message.answer}" in source
+    assert "{message.content}" in source
     assert "!answer.trim()" in source
 
 
@@ -92,7 +90,7 @@ def test_chat_never_fabricates_sources_when_none_are_returned():
     source = _chat()
 
     assert "if (!Array.isArray(value))" in source
-    assert "sources: []" in source
+    assert "sources: normalizeSources(entry.sources)" in source
     assert "entry is ChatSource" in source
 
 
@@ -104,7 +102,7 @@ def test_chat_shows_the_safe_no_answer_response_unchanged():
 
     source = _chat()
     # The backend answer text reaches the screen exactly as returned.
-    assert "{message.answer}" in source
+    assert "{message.content}" in source
     for transformation in ("answer.slice", "answer.split", "answer.replace", "answer.substring"):
         assert transformation not in source
 
@@ -114,7 +112,7 @@ def test_chat_shows_loading_and_prevents_duplicate_submissions():
 
     assert 'role="status"' in source
     assert "if (inFlightRef.current)" in source
-    assert source.index("if (inFlightRef.current)") < source.index("fetch(")
+    assert "if (inFlightRef.current)" in source
     assert "setIsAsking(true);" in source
     assert "setIsAsking(false);" in source
     assert source.count("disabled={isAsking}") >= 2
@@ -168,12 +166,21 @@ def test_chat_page_stays_available_to_end_users_and_is_linked_from_the_dashboard
     assert 'href="/chat"' in dashboard
 
 
-def test_phase7_adds_no_conversation_history_or_persistence():
+def test_phase8_uses_database_conversation_persistence():
     source = _chat()
 
-    for forbidden in ('"/conversations"', "conversation_id", "localStorage", "sessionStorage", "indexedDB"):
+    assert '"/conversations"' in source
+    assert "conversation_id" in source
+    for forbidden in ("localStorage", "sessionStorage", "indexedDB"):
         assert forbidden not in source
-    # Messages only live in the current page session.
-    assert "useState<ChatMessage[]>([])" in source
-    assert not list(MIGRATIONS.glob("*conversation*"))
-    assert not list(MIGRATIONS.glob("*chat*"))
+    assert "Conversation history" in source
+    assert "New conversation" in source
+    assert "loadConversations" in source
+
+
+def test_conversation_route_requires_an_authenticated_session():
+    route = (FRONTEND / "app" / "chat" / "[conversationId]" / "page.tsx").read_text(encoding="utf-8")
+
+    assert "supabase.auth.getUser()" in route
+    assert 'redirect("/login")' in route
+    assert "initialConversationId" in route

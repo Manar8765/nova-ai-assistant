@@ -86,7 +86,12 @@ def _sources_from_chunks(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
-def answer_question(client: Client, company_id: str, question: str) -> dict[str, Any]:
+def answer_question(
+    client: Client,
+    company_id: str,
+    question: str,
+    history: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
     """Answer a question from the company knowledge base.
 
     ``company_id`` always comes from the authenticated profile, never from the request.
@@ -105,7 +110,7 @@ def answer_question(client: Client, company_id: str, question: str) -> dict[str,
 
     try:
         context = build_context(chunks)
-        answer = generate_answer(normalized, context)
+        answer = generate_answer(normalized, context, history)
         supporting_sources = identify_supporting_sources(normalized, answer, context, len(chunks))
     except GenerationError as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=exc.reason) from exc
