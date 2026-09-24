@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,7 @@ from app.embeddings import EMBEDDING_DIMENSIONS, EMBEDDING_MODEL, format_embeddi
 from app.generation import (
     DEFAULT_GENERATION_MODEL,
     GENERATION_REASON,
+    SOURCE_VERIFICATION_INSTRUCTION,
     SYSTEM_INSTRUCTION,
     get_generation_model,
 )
@@ -96,11 +98,20 @@ class FakeGroqCompletion:
 
 
 class FakeGroqChatCompletions:
-    """Records every grounded-generation request the endpoint makes."""
+    """Records every grounded-generation and source-verification request."""
 
-    def __init__(self, *, answer=GENERATED_ANSWER, failure=None):
+    def __init__(
+        self,
+        *,
+        answer=GENERATED_ANSWER,
+        failure=None,
+        supporting_sources=None,
+        verification_failure=None,
+    ):
         self.answer = answer
         self.failure = failure
+        self.supporting_sources = supporting_sources
+        self.verification_failure = verification_failure
         self.generation_calls: list[dict[str, Any]] = []
 
     def create(self, *, model, messages, temperature, max_completion_tokens):
@@ -115,9 +126,22 @@ class FakeGroqChatCompletions:
                 "messages": messages,
             }
         )
+
+        if roles.get("system") == SOURCE_VERIFICATION_INSTRUCTION:
+            if self.verification_failure is not None:
+                raise self.verification_failure
+            return FakeGroqCompletion(json.dumps(self._supporting_sources(roles.get("user", ""))))
+
         if self.failure is not None:
             raise self.failure
         return FakeGroqCompletion(self.answer)
+
+    def _supporting_sources(self, verification_prompt: str) -> list[int]:
+        if self.supporting_sources is not None:
+            return list(self.supporting_sources)
+        # Default treats every retrieved source as supportive, which mirrors the Phase 6
+        # behaviour so retrieval-focused tests keep their full Top-K response.
+        return list(range(1, verification_prompt.count("[Source ") + 1))
 
 
 class FakeGroqChat:
@@ -251,10 +275,17 @@ def rag(monkeypatch):
         answer=GENERATED_ANSWER,
         embedding_failure=None,
         generation_failure=None,
+        supporting_sources=None,
+        verification_failure=None,
     ):
         models = FakeGeminiModels(embedding_failure=embedding_failure)
         monkeypatch.setattr(embeddings, "get_gemini_client", lambda: FakeGeminiClient(models))
-        chat = FakeGroqChatCompletions(answer=answer, failure=generation_failure)
+        chat = FakeGroqChatCompletions(
+            answer=answer,
+            failure=generation_failure,
+            supporting_sources=supporting_sources,
+            verification_failure=verification_failure,
+        )
         monkeypatch.setattr(generation, "get_groq_client", lambda: FakeGroqClient(chat))
         client = FakeRagClient(chunks, retrieval_failure)
         app.dependency_overrides[get_supabase_client] = lambda: client
@@ -470,6 +501,12 @@ def test_company_a_cannot_retrieve_company_b_chunks(rag):
     assert OTHER_COMPANY_CONTENT not in prompt
     assert "company-b-internal.txt" not in prompt
     assert COMPANY_B not in prompt
+
+    # The source-verification call only ever sees this company's retrieved context.
+    verification = harness.generation_calls[1]["user"]
+    assert OTHER_COMPANY_CONTENT not in verification
+    assert "company-b-internal.txt" not in verification
+    assert COMPANY_B not in verification
 
 
 def test_no_relevant_chunks_returns_an_answer_without_calling_groq(rag):
@@ -688,5 +725,102 @@ def test_rag_endpoint_derives_the_company_from_the_authenticated_profile():
     assert "company_id" not in RagQueryIn.model_fields
 
 
+def test_unknown_question_returns_the_safe_answer_with_no_sources(rag):
+    # Threshold-passing noise is retrieved, but nothing supports the answer.
+    harness = rag(
+        chunks=[
+            _chunk("Candidate CV summary for a sales role.", filename="cv.txt", similarity=0.72),
+            _chunk(
+                "Loose sentences from an unrelated corpus.",
+                chunk_id=CHUNK_A2,
+                filename="sentences.txt",
+                chunk_index=1,
+                similarity=0.61,
+            ),
+        ],
+        answer="The company's knowledge base does not contain enough information to answer that question.",
+        supporting_sources=[],
+    )
+
+    response = _query("What is the employee vacation policy?")
+
+    assert response.status_code == 200
+    assert response.json() == {"answer": NO_ANSWER_MESSAGE, "sources": []}
+    assert "cv.txt" not in response.text
+    assert "sentences.txt" not in response.text
+    assert len(harness.generation_calls) == 2  # answer generation, then source verification
 
 
+def test_known_question_returns_only_the_source_that_supports_the_answer(rag):
+    harness = rag(
+        chunks=[
+            _chunk(RETURN_POLICY_CONTENT, filename="return-policy.txt", similarity=0.91),
+            _chunk(
+                "Scratch notes text.",
+                chunk_id=CHUNK_A2,
+                filename="New Text Document (2).txt",
+                chunk_index=1,
+                similarity=0.74,
+            ),
+            _chunk(
+                "Loose sentences from an unrelated corpus.",
+                chunk_id="dddddddd-dddd-dddd-dddd-dddddddddddd",
+                filename="sentences.txt",
+                chunk_index=2,
+                similarity=0.68,
+            ),
+        ],
+        supporting_sources=[1],
+    )
+
+    response = _query()
+
+    body = response.json()
+    assert body["answer"] == GENERATED_ANSWER
+    assert [source["filename"] for source in body["sources"]] == ["return-policy.txt"]
+    assert "New Text Document (2).txt" not in response.text
+    assert "sentences.txt" not in response.text
+    assert len(harness.generation_calls) == 2
+
+
+def test_unrelated_retrieved_chunks_are_not_exposed_as_misleading_sources(rag):
+    # The unrelated file ranks FIRST in retrieval but is not evidence for the answer.
+    harness = rag(
+        chunks=[
+            _chunk("HR candidate CV notes.", filename="New Text Document (2).txt", similarity=0.95),
+            _chunk(
+                RETURN_POLICY_CONTENT,
+                chunk_id=CHUNK_A2,
+                filename="return-policy.txt",
+                chunk_index=1,
+                similarity=0.82,
+            ),
+        ],
+        supporting_sources=[2],
+    )
+
+    response = _query()
+
+    assert response.json()["answer"] == GENERATED_ANSWER
+    assert [source["filename"] for source in response.json()["sources"]] == ["return-policy.txt"]
+    assert "New Text Document (2).txt" not in response.text
+
+    # Both rows were retrieved into the verification context; only the evidence survives.
+    verification = harness.generation_calls[1]["user"]
+    assert "New Text Document (2).txt" in verification
+    assert "return-policy.txt" in verification
+
+
+def test_source_verification_failure_returns_a_safe_error(rag):
+    harness = rag(
+        chunks=[_chunk()],
+        verification_failure=RuntimeError("503 verifier unavailable: internal detail"),
+    )
+
+    response = _query()
+
+    assert response.status_code == 502
+    detail = response.json()["detail"]
+    assert detail == GENERATION_REASON
+    assert "verifier" not in detail.lower()
+    assert "internal detail" not in detail

@@ -14,11 +14,13 @@ from app.generation import (
     GENERATION_REASON,
     GENERATION_TEMPERATURE,
     MAX_OUTPUT_TOKENS,
+    SOURCE_VERIFICATION_INSTRUCTION,
     SYSTEM_INSTRUCTION,
     GenerationError,
     build_prompt,
     generate_answer,
     get_generation_model,
+    identify_supporting_sources,
 )
 
 QUESTION = "How many days do I have to return a product?"
@@ -219,3 +221,70 @@ def test_embeddings_remain_on_gemini_after_the_generation_swap():
 
     assert EMBEDDING_MODEL == "gemini-embedding-2"
     assert 'os.getenv("GEMINI_API_KEY")' in source
+
+
+def test_identify_supporting_sources_returns_the_json_array_numbers(groq):
+    client = groq(_completion("[1, 3]"))
+
+    supporting = identify_supporting_sources(QUESTION, GENERATED_ANSWER, CONTEXT, source_count=3)
+
+    assert supporting == [1, 3]
+    call = client.calls[0]
+    assert call["messages"][0] == {"role": "system", "content": SOURCE_VERIFICATION_INSTRUCTION}
+    user_content = call["messages"][1]["content"]
+    assert QUESTION in user_content
+    assert GENERATED_ANSWER in user_content
+    assert "[Source 1]" in user_content
+    assert call["temperature"] == GENERATION_TEMPERATURE
+
+
+def test_identify_supporting_sources_tolerates_markdown_fences(groq):
+    groq(_completion("```json\n[2]\n```"))
+
+    supporting = identify_supporting_sources(QUESTION, GENERATED_ANSWER, CONTEXT, source_count=2)
+
+    assert supporting == [2]
+
+
+def test_identify_supporting_sources_ignores_out_of_range_and_duplicate_numbers(groq):
+    groq(_completion("[0, 2, 2, 9]"))
+
+    supporting = identify_supporting_sources(QUESTION, GENERATED_ANSWER, CONTEXT, source_count=2)
+
+    assert supporting == [2]
+
+
+def test_identify_supporting_sources_accepts_an_empty_array(groq):
+    groq(_completion("[]"))
+
+    assert identify_supporting_sources(QUESTION, GENERATED_ANSWER, CONTEXT, source_count=2) == []
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Sources: 1, 2",
+        "",
+        "[true]",
+        '{"sources": [1]}',
+    ],
+)
+def test_identify_supporting_sources_rejects_unusable_responses(groq, content):
+    groq(_completion(content))
+
+    with pytest.raises(GenerationError) as exc_info:
+        identify_supporting_sources(QUESTION, GENERATED_ANSWER, CONTEXT, source_count=2)
+
+    assert exc_info.value.reason == GENERATION_REASON
+
+
+def test_identify_supporting_sources_reports_api_failures_safely(groq):
+    groq(RuntimeError("429 rate_limit_exceeded for api key gsk_secret-key"))
+
+    with pytest.raises(GenerationError) as exc_info:
+        identify_supporting_sources(QUESTION, GENERATED_ANSWER, CONTEXT, source_count=2)
+
+    reason = exc_info.value.reason
+    assert reason == GENERATION_REASON
+    for leaked in ("gsk_secret-key", "429", "rate_limit_exceeded", "RuntimeError"):
+        assert leaked not in reason

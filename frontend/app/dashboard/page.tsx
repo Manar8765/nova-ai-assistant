@@ -52,6 +52,9 @@ export default async function DashboardPage() {
         )}
       </section>
       <p>
+        <Link href="/chat">Ask the AI Assistant</Link>
+      </p>
+      <p>
         <Link href="/documents">Manage documents</Link>
       </p>
       <LogoutButton />

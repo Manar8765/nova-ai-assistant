@@ -11,7 +11,7 @@ from supabase import Client
 
 from app.documents import AuthenticatedProfile, get_authenticated_profile, get_supabase_client
 from app.embeddings import EmbeddingError, format_embedding_for_database, generate_embedding
-from app.generation import GenerationError, generate_answer
+from app.generation import GenerationError, generate_answer, identify_supporting_sources
 from app.retrieval import RetrievalError, build_context, retrieve_chunks
 
 router = APIRouter(prefix="/rag", tags=["rag"])
@@ -104,11 +104,20 @@ def answer_question(client: Client, company_id: str, question: str) -> dict[str,
         return {"answer": NO_ANSWER_MESSAGE, "sources": []}
 
     try:
-        answer = generate_answer(normalized, build_context(chunks))
+        context = build_context(chunks)
+        answer = generate_answer(normalized, context)
+        supporting_sources = identify_supporting_sources(normalized, answer, context, len(chunks))
     except GenerationError as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=exc.reason) from exc
 
-    return {"answer": answer, "sources": _sources_from_chunks(chunks)}
+    if not supporting_sources:
+        # The answer is not backed by any retrieved excerpt, so the knowledge base is
+        # insufficient: report the safe no-answer response instead of exposing arbitrary
+        # Top-K retrieval results as sources.
+        return {"answer": NO_ANSWER_MESSAGE, "sources": []}
+
+    evidence = [chunks[index - 1] for index in supporting_sources]
+    return {"answer": answer, "sources": _sources_from_chunks(evidence)}
 
 
 @router.post("/query", response_model=RagAnswerOut)
