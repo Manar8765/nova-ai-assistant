@@ -6,3 +6,5 @@ truststore==0.10.4
 pypdf==5.9.0
 python-docx==1.2.0
 google-genai==2.25.0
+# Grounded RAG answer generation runs on Groq Chat Completions; embeddings stay on Gemini.
+groq==1.7.0

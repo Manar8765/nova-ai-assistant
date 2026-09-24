@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.documents import router as documents_router
+from app.rag import router as rag_router
 
 app = FastAPI(title="Nova AI Assistant API")
 
@@ -14,6 +15,7 @@ app.add_middleware(
 )
 
 app.include_router(documents_router)
+app.include_router(rag_router)
 
 
 @app.get("/health")
