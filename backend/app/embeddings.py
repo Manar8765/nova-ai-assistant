@@ -32,9 +32,10 @@ EMBEDDING_REASON = (
 class EmbeddingError(RuntimeError):
     """Raised when a chunk embedding cannot be produced or validated."""
 
-    def __init__(self, reason: str):
+    def __init__(self, reason: str, *, retryable: bool = False):
         super().__init__(reason)
         self.reason = reason
+        self.retryable = retryable
 
 
 @lru_cache
@@ -70,7 +71,7 @@ def generate_embedding(text: str) -> list[float]:
     except Exception as exc:
         # Rate limits, network errors and provider failures stay in the logs.
         logger.exception("Gemini embedding request failed.")
-        raise EmbeddingError(EMBEDDING_REASON) from exc
+        raise EmbeddingError(EMBEDDING_REASON, retryable=True) from exc
 
     return _validated_vector(response)
 

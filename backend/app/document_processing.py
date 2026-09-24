@@ -22,14 +22,16 @@ CORRUPTED_REASON = "The document appears to be corrupted or unreadable."
 NO_TEXT_REASON = "Unable to extract readable text from this document."
 UTF8_REASON = "Unable to read this text file. Please save it as UTF-8 and try again."
 TEMPORARY_REASON = "We couldn't process this document due to a temporary system error. Please try again."
+MAX_PROCESSING_ATTEMPTS = 3
 
 
 class DocumentProcessingError(ValueError):
     """Raised when a supported document cannot yield usable text."""
 
-    def __init__(self, reason: str):
+    def __init__(self, reason: str, *, retryable: bool = False):
         super().__init__(reason)
         self.reason = reason
+        self.retryable = retryable
 
 
 def extract_pdf_text(content: bytes) -> str:
@@ -107,7 +109,7 @@ def embed_chunks(chunks: list[str]) -> list[dict[str, Any]]:
             embedding = format_embedding_for_database(generate_embedding(chunk))
         except EmbeddingError as exc:
             logger.error("Embedding generation failed for chunk_index=%s.", index)
-            raise DocumentProcessingError(exc.reason) from exc
+            raise DocumentProcessingError(exc.reason, retryable=exc.retryable) from exc
         embedded.append({"chunk_index": index, "content": chunk, "embedding": embedding})
     return embedded
 
@@ -188,38 +190,69 @@ def process_document(
     The expected path prevents an older background task from writing chunks after a
     replacement has stored a newer file for the same document ID.
     """
-    try:
-        document = _get_document(client, document_id, company_id)
-        if (
-            not document
-            or document["file_path"] != expected_file_path
-            or document["processing_generation"] != processing_generation
-        ):
+    for attempt in range(1, MAX_PROCESSING_ATTEMPTS + 1):
+        try:
+            document = _get_document(client, document_id, company_id)
+            if (
+                not document
+                or document["file_path"] != expected_file_path
+                or document["processing_generation"] != processing_generation
+            ):
+                return
+
+            if not _begin_processing(client, document_id, company_id, expected_file_path, processing_generation):
+                return
+            content = client.storage.from_(DOCUMENT_BUCKET).download(expected_file_path)
+            chunks = chunk_text(extract_text(document["file_type"], content))
+            if not chunks:
+                raise DocumentProcessingError(NO_TEXT_REASON)
+            embedded_chunks = embed_chunks(chunks)
+            if not _replace_chunks(
+                client, document_id, company_id, expected_file_path, processing_generation, embedded_chunks
+            ):
+                return
+            _set_status(client, document_id, company_id, expected_file_path, processing_generation, "READY")
+            return
+        except DocumentProcessingError as exc:
+            logger.exception("Document processing failed for document_id=%s", document_id)
+            if not exc.retryable or attempt >= MAX_PROCESSING_ATTEMPTS:
+                _mark_processing_failed(
+                    client, document_id, company_id, expected_file_path, processing_generation, exc.reason
+                )
+                return
+            logger.warning(
+                "Retryable document processing failure for document_id=%s; retrying attempt %s/%s.",
+                document_id,
+                attempt + 1,
+                MAX_PROCESSING_ATTEMPTS,
+                exc_info=True,
+            )
+        except Exception:
+            if attempt < MAX_PROCESSING_ATTEMPTS:
+                logger.warning(
+                    "Transient document processing failure for document_id=%s; retrying attempt %s/%s.",
+                    document_id,
+                    attempt + 1,
+                    MAX_PROCESSING_ATTEMPTS,
+                    exc_info=True,
+                )
+                continue
+            logger.exception("Document processing failed after retries for document_id=%s", document_id)
+            _mark_processing_failed(
+                client, document_id, company_id, expected_file_path, processing_generation, TEMPORARY_REASON
+            )
             return
 
-        if not _begin_processing(client, document_id, company_id, expected_file_path, processing_generation):
-            return
-        content = client.storage.from_(DOCUMENT_BUCKET).download(expected_file_path)
-        chunks = chunk_text(extract_text(document["file_type"], content))
-        if not chunks:
-            raise DocumentProcessingError(NO_TEXT_REASON)
-        # Embeddings are generated for every chunk before the chunk set is persisted, so the
-        # document never reaches READY with a chunk that has no embedding.
-        embedded_chunks = embed_chunks(chunks)
-        if not _replace_chunks(
-            client, document_id, company_id, expected_file_path, processing_generation, embedded_chunks
-        ):
-            return
-        _set_status(client, document_id, company_id, expected_file_path, processing_generation, "READY")
-    except DocumentProcessingError as exc:
-        logger.exception("Document processing failed for document_id=%s", document_id)
-        try:
-            _set_status(client, document_id, company_id, expected_file_path, processing_generation, "FAILED", exc.reason)
-        except Exception:
-            logger.exception("Unable to mark document_id=%s as FAILED", document_id)
+
+def _mark_processing_failed(
+    client: Client,
+    document_id: str,
+    company_id: str,
+    expected_file_path: str,
+    processing_generation: int,
+    reason: str,
+) -> None:
+    try:
+        _set_status(client, document_id, company_id, expected_file_path, processing_generation, "FAILED", reason)
     except Exception:
-        logger.exception("Document processing failed for document_id=%s", document_id)
-        try:
-            _set_status(client, document_id, company_id, expected_file_path, processing_generation, "FAILED", TEMPORARY_REASON)
-        except Exception:
-            logger.exception("Unable to mark document_id=%s as FAILED", document_id)
+        logger.exception("Unable to mark document_id=%s as FAILED", document_id)

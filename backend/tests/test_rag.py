@@ -543,6 +543,37 @@ def test_retrieval_failure_returns_a_safe_error(rag):
     assert harness.generation_calls == []
 
 
+def test_malformed_retrieval_row_returns_a_safe_error_without_source_metadata(rag):
+    harness = rag()
+
+    class MalformedRpc:
+        def execute(self):
+            return FakeResponse([{"document_id": DOCUMENT_A}])
+
+    harness.client.rpc = lambda name, params: MalformedRpc()
+    response = _query()
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == RETRIEVAL_REASON
+    assert harness.generation_calls == []
+
+
+def test_non_finite_retrieval_similarity_returns_a_safe_error(rag):
+    harness = rag()
+
+    class MalformedRpc:
+        def execute(self):
+            row = _chunk()
+            row["similarity"] = float("nan")
+            return FakeResponse([row])
+
+    harness.client.rpc = lambda name, params: MalformedRpc()
+    response = _query()
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == RETRIEVAL_REASON
+
+
 def test_context_builder_labels_every_source_without_inventing_pages():
     context = build_context(
         [

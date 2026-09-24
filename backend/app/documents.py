@@ -241,13 +241,18 @@ def _upload_file(client: Client, path: str, content: bytes, content_type: str, *
 
 
 def _remove_file(client: Client, path: str) -> None:
-    client.storage.from_(DOCUMENT_BUCKET).remove([path])
+    try:
+        client.storage.from_(DOCUMENT_BUCKET).remove([path])
+    except Exception:
+        logger.exception("Unable to remove storage object path=%s.", path)
+        raise
 
 
 def _download_file(client: Client, path: str) -> bytes:
     try:
         return client.storage.from_(DOCUMENT_BUCKET).download(path)
     except Exception as exc:
+        logger.exception("Unable to download storage object path=%s.", path)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="We couldn't retrieve this document due to a temporary system error. Please try again.",
@@ -291,6 +296,7 @@ def _get_document_or_404(client: Client, document_id: UUID, company_id: str) -> 
             .execute()
         )
     except Exception as exc:
+        logger.exception("Unable to retrieve document_id=%s.", document_id)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Unable to retrieve the document.",
@@ -336,7 +342,7 @@ async def create_document(
         try:
             _remove_file(client, path)
         except Exception:
-            pass
+            logger.error("Storage cleanup failed after metadata save failure for path=%s.", path)
         _ensure_filename_available(client, profile.company_id, filename)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -362,6 +368,7 @@ def list_documents(
             .execute()
         )
     except Exception as exc:
+        logger.exception("Unable to list documents for company_id=%s.", profile.company_id)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Unable to retrieve documents.",
@@ -416,6 +423,7 @@ async def replace_document(
             values,
         )
     except Exception as exc:
+        logger.exception("Unable to replace document_id=%s.", document_id)
         if new_path == old_path and old_content is not None:
             try:
                 _upload_file(
@@ -442,7 +450,7 @@ async def replace_document(
             _remove_file(client, old_path)
         except Exception:
             # The database now points at the new file; the old object is inaccessible to users.
-            pass
+            logger.exception("Unable to remove superseded storage object path=%s.", old_path)
 
     background_tasks.add_task(
         process_document,

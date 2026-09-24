@@ -1,11 +1,31 @@
+import logging
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi import Request
+from fastapi.responses import JSONResponse
 
 from app.documents import router as documents_router
 from app.conversations import router as conversations_router
 from app.rag import router as rag_router
 
 app = FastAPI(title="Nova AI Assistant API")
+logger = logging.getLogger(__name__)
+
+
+@app.exception_handler(Exception)
+async def unexpected_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    logger.error(
+        "Unexpected API error for %s %s: %s.",
+        request.method,
+        request.url.path,
+        exc,
+        exc_info=(type(exc), exc, exc.__traceback__),
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "An unexpected server error occurred. Please try again."},
+    )
 
 app.add_middleware(
     CORSMiddleware,

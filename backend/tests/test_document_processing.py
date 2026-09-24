@@ -9,6 +9,7 @@ from docx import Document
 from google.genai import types
 
 from app import embeddings
+from app import document_processing
 from app.document_processing import (
     CHUNK_OVERLAP,
     CHUNK_SIZE,
@@ -339,6 +340,39 @@ def test_temporary_processing_exception_uses_safe_reason(monkeypatch):
     assert "secret URL" not in client.document["failure_reason"]
 
 
+def test_transient_embedding_failure_retries_and_succeeds(monkeypatch):
+    client = FakeProcessingClient(b"retryable text")
+    calls = {"count": 0}
+    def flaky_embedding(text):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("temporary provider failure")
+        return _chunk_vector(text)
+
+    monkeypatch.setattr(document_processing, "generate_embedding", flaky_embedding)
+    process_document(client, "document-1", "company-1", client.document["file_path"], 0)
+
+    assert calls["count"] == 2
+    assert client.document["status"] == "READY"
+    assert len(client.chunks) == 1
+
+
+def test_permanent_embedding_shape_failure_is_not_retried(monkeypatch):
+    client = FakeProcessingClient(b"invalid embedding")
+    calls = {"count": 0}
+
+    def invalid_embedding(_text):
+        calls["count"] += 1
+        raise EmbeddingError(EMBEDDING_REASON)
+
+    monkeypatch.setattr(document_processing, "generate_embedding", invalid_embedding)
+    process_document(client, "document-1", "company-1", client.document["file_path"], 0)
+
+    assert calls["count"] == 1
+    assert client.document["status"] == "FAILED"
+    assert client.chunks == []
+
+
 def test_reprocessing_replaces_chunks_without_duplicates():
     client = FakeProcessingClient(b"repeatable text")
     process_document(client, "document-1", "company-1", client.document["file_path"], 0)
@@ -475,7 +509,7 @@ def test_multiple_chunks_receive_their_own_distinct_embedding(fake_gemini):
         assert chunk["embedding"] == format_embedding_for_database(_chunk_vector(chunk["content"]))
 
 
-def test_one_failed_embedding_keeps_the_document_failed_and_persists_no_chunks(fake_gemini):
+def test_one_transient_embedding_failure_retries_and_completes_without_duplicates(fake_gemini):
     gemini = fake_gemini(
         failure_trigger=lambda index, _text: RuntimeError("provider unavailable") if index == 2 else None
     )
@@ -484,10 +518,24 @@ def test_one_failed_embedding_keeps_the_document_failed_and_persists_no_chunks(f
 
     process_document(client, "document-1", "company-1", client.document["file_path"], 0)
 
+    assert len(gemini.models.calls) == 7
+    assert client.document["status"] == "READY"
+    assert client.document["failure_reason"] is None
+    assert client.status_history == ["UPLOADED", "PROCESSING", "PROCESSING", "READY"]
+    assert len(client.chunks) == len(set(chunk["chunk_index"] for chunk in client.chunks))
+
+
+def test_transient_embedding_failure_is_bounded_and_marks_failed(fake_gemini):
+    gemini = fake_gemini(
+        failure_trigger=lambda _index, _text: RuntimeError("provider unavailable")
+    )
+    client = FakeProcessingClient(b"one chunk")
+
+    process_document(client, "document-1", "company-1", client.document["file_path"], 0)
+
     assert len(gemini.models.calls) == 3
     assert client.document["status"] == "FAILED"
     assert client.document["failure_reason"] == EMBEDDING_REASON
-    assert client.status_history == ["UPLOADED", "PROCESSING", "FAILED"]
     assert client.chunks == []
 
 

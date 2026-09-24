@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any
+from uuid import UUID
 
 from supabase import Client
 
@@ -18,6 +20,7 @@ RETRIEVAL_REASON = (
     "We couldn't search the company knowledge base due to a temporary system error. "
     "Please try again."
 )
+REQUIRED_RESULT_FIELDS = ("document_id", "chunk_id", "filename", "chunk_index", "content", "similarity")
 
 
 class RetrievalError(RuntimeError):
@@ -48,7 +51,29 @@ def retrieve_chunks(client: Client, company_id: str, query_embedding: str) -> li
         logger.exception("Knowledge base retrieval failed.")
         raise RetrievalError(RETRIEVAL_REASON) from exc
 
-    return list(response.data or [])
+    rows = response.data or []
+    if not isinstance(rows, list):
+        logger.error("Knowledge base retrieval returned a non-list result.")
+        raise RetrievalError(RETRIEVAL_REASON)
+    valid_rows: list[dict[str, Any]] = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict) or any(field not in row for field in REQUIRED_RESULT_FIELDS):
+            logger.error("Knowledge base retrieval returned malformed row at index=%s.", index)
+            raise RetrievalError(RETRIEVAL_REASON)
+        try:
+            UUID(str(row["document_id"]))
+            UUID(str(row["chunk_id"]))
+            if not isinstance(row["filename"], str) or not isinstance(row["content"], str):
+                raise ValueError
+            row["similarity"] = float(row["similarity"])
+            row["chunk_index"] = int(row["chunk_index"])
+            if not math.isfinite(row["similarity"]) or row["chunk_index"] < 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            logger.error("Knowledge base retrieval returned invalid metadata at index=%s.", index)
+            raise RetrievalError(RETRIEVAL_REASON)
+        valid_rows.append(row)
+    return valid_rows
 
 
 def build_context(chunks: list[dict[str, Any]]) -> str:

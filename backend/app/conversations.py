@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Annotated, Any
 from uuid import UUID
 
@@ -13,6 +14,7 @@ from app.documents import AuthenticatedProfile, get_authenticated_profile, get_s
 from app.rag import answer_question, validate_question
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
+logger = logging.getLogger(__name__)
 
 
 class ConversationCreateIn(BaseModel):
@@ -48,6 +50,7 @@ class AppendMessagesOut(BaseModel):
 
 
 def _database_error(message: str, exc: Exception) -> HTTPException:
+    logger.exception("Conversation database operation failed.", exc_info=exc)
     return HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=message)
 
 
@@ -143,6 +146,7 @@ def create_conversation(
     client: Annotated[Client, Depends(get_supabase_client)],
     payload: ConversationCreateIn | None = None,
 ) -> dict[str, Any]:
+    logger.info("Creating conversation for user_id=%s.", profile.user_id)
     title = _conversation_title(payload.title if payload else None)
     try:
         response = (
@@ -162,6 +166,7 @@ def list_conversations(
     profile: Annotated[AuthenticatedProfile, Depends(get_authenticated_profile)],
     client: Annotated[Client, Depends(get_supabase_client)],
 ) -> list[dict[str, Any]]:
+    logger.info("Listing conversations for user_id=%s.", profile.user_id)
     try:
         response = (
             client.table("conversation")
@@ -212,6 +217,7 @@ def list_messages(
     profile: Annotated[AuthenticatedProfile, Depends(get_authenticated_profile)],
     client: Annotated[Client, Depends(get_supabase_client)],
 ) -> list[dict[str, Any]]:
+    logger.info("Listing messages for conversation_id=%s.", conversation_id)
     _require_conversation(client, profile, conversation_id)
     try:
         response = (
@@ -234,6 +240,7 @@ def append_message(
     profile: Annotated[AuthenticatedProfile, Depends(get_authenticated_profile)],
     client: Annotated[Client, Depends(get_supabase_client)],
 ) -> dict[str, Any]:
+    logger.info("Appending message to conversation_id=%s.", conversation_id)
     _require_conversation(client, profile, conversation_id)
     question = validate_question(payload.question)
     history = _load_recent_history(client, profile, conversation_id)
