@@ -102,8 +102,9 @@ export function AuthForm({ mode, initialError }: AuthFormProps) {
   }
 
   return (
-    <main>
-      <h1>{isSignUp ? "Create an account" : "Sign in"}</h1>
+    <main className="auth-page">
+      <div className="auth-aside"><Link href="/login" className="brand auth-brand"><span className="brand-mark">N</span><span>nova</span></Link><div className="auth-quote"><div className="quote-mark">“</div><p>Turn your company knowledge into clear, reliable answers.</p><span>Nova AI Assistant</span></div><div className="auth-aside-footer">Secure, company-scoped knowledge management</div></div>
+      <div className="auth-content"><div className="auth-card"><div className="mobile-auth-brand"><Link href="/login" className="brand"><span className="brand-mark">N</span><span>nova</span></Link></div><p className="eyebrow">Welcome to Nova</p><h1>{isSignUp ? "Create your workspace" : "Welcome back"}</h1><p className="auth-description">{isSignUp ? "Start giving your team instant access to trusted company knowledge." : "Sign in to continue to your knowledge workspace."}</p>
       <form onSubmit={handleSubmit}>
         {isSignUp ? (
           <>
@@ -127,20 +128,21 @@ export function AuthForm({ mode, initialError }: AuthFormProps) {
           required
         />
 
-        {error ? <p role="alert">{error}</p> : null}
-        {message ? <p role="status">{message}</p> : null}
+        {error ? <div className="alert alert-error" role="alert">{error}</div> : null}
+        {message ? <div className="alert alert-success" role="status">{message}</div> : null}
 
-        <button type="submit" disabled={isSubmitting}>
+        <button className="button button-primary auth-submit" type="submit" disabled={isSubmitting}>
           {isSubmitting ? "Please wait…" : isSignUp ? "Create account" : "Sign in"}
         </button>
       </form>
 
-      <p>
+      <p className="auth-switch">
         {isSignUp ? "Already have an account?" : "Need an account?"}{" "}
         <Link href={isSignUp ? "/login" : "/signup"}>
           {isSignUp ? "Sign in" : "Sign up"}
         </Link>
       </p>
+      </div></div>
     </main>
   );
 }

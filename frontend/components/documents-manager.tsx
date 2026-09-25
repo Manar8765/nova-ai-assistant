@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useCallback, useEffect, useState, type ChangeEvent, type FormEvent } from "react";
 import { createClient } from "../lib/supabase/client";
+import { AppShell, Icon } from "./app-shell";
 
 type DocumentRecord = {
   document_id: string;
@@ -167,73 +168,56 @@ export function DocumentsManager() {
   }
 
   return (
-    <main>
-      <p>
-        <Link href="/dashboard">Back to dashboard</Link>
-      </p>
-      <h1>Documents</h1>
-
-      <form onSubmit={uploadDocument}>
-        <label htmlFor="document-file">Upload PDF, TXT, or DOCX (max 10 MB)</label>
-        <input id="document-file" name="file" type="file" accept=".pdf,.txt,.docx" required />
-        <button type="submit" disabled={isUploading}>
-          {isUploading ? "Uploading..." : "Upload document"}
-        </button>
-      </form>
-
-      {error ? <p role="alert">{error}</p> : null}
-      {message ? <p role="status">{message}</p> : null}
-
-      {isLoading ? <p>Loading documents...</p> : null}
-      {!isLoading && documents.length === 0 ? <p>No documents have been uploaded yet.</p> : null}
-      {!isLoading && documents.length > 0 ? (
-        <table>
+    <AppShell title="Documents" description="Manage the files that power Nova's grounded answers.">
+      <div className="page-actions">
+        <form className="upload-form" onSubmit={uploadDocument}>
+          <label className="button button-secondary upload-button" htmlFor="document-file">Choose file</label>
+          <input className="visually-hidden" id="document-file" name="file" type="file" accept=".pdf,.txt,.docx" required />
+          <button className="button button-primary upload-button" type="submit" disabled={isUploading}><Icon name="plus" /> {isUploading ? "Uploading..." : "Upload document"}</button>
+          <span className="upload-hint">PDF, TXT, or DOCX · up to 10 MB</span>
+        </form>
+      </div>
+      {error ? <div className="alert alert-error" role="alert">{error}</div> : null}
+      {message ? <div className="alert alert-success" role="status">{message}</div> : null}
+      <div className="panel documents-panel">
+        <div className="panel-heading"><div><h2>Knowledge base</h2><p>{documents.length} {documents.length === 1 ? "document" : "documents"} in your workspace</p></div><span className="table-caption">Updated just now</span></div>
+        {isLoading ? <div className="loading-state"><span className="spinner" /> Loading documents...</div> : null}
+        {!isLoading && documents.length === 0 ? <div className="empty-state"><div className="empty-icon"><Icon name="file" /></div><h3>Your knowledge base is empty</h3><p>Upload your first document to start asking Nova questions grounded in your company data.</p><label className="button button-secondary" htmlFor="document-file">Choose a document</label></div> : null}
+        {!isLoading && documents.length > 0 ? (
+          <div className="table-wrap"><table>
           <thead>
             <tr>
-              <th scope="col">Filename</th>
-              <th scope="col">Type</th>
-              <th scope="col">Size</th>
-              <th scope="col">Status</th>
-              <th scope="col">Actions</th>
+              <th scope="col">Document</th><th scope="col">Type</th><th scope="col">Size</th><th scope="col">Status</th><th scope="col"><span className="sr-only">Actions</span></th>
             </tr>
           </thead>
           <tbody>
             {documents.map((document) => (
               <tr key={document.document_id}>
-                <td>{document.filename}</td>
-                <td>{document.file_type}</td>
-                <td>{formatFileSize(document.file_size)}</td>
-                <td>
-                  {document.status}
+                <td><div className="document-name"><span className="file-avatar">{document.file_type.slice(0, 3)}</span><strong>{document.filename}</strong></div></td>
+                <td className="muted-cell">{document.file_type}</td><td className="muted-cell">{formatFileSize(document.file_size)}</td>
+                <td><span className={`status-badge ${document.status.toLowerCase()}`}>{document.status.toLowerCase()}</span>
                   {document.status === "FAILED" && document.failure_reason ? (
-                    <>
-                      <br />
-                      Reason: {document.failure_reason}
-                    </>
+                    <span className="failure-note">{document.failure_reason}</span>
                   ) : null}
                 </td>
-                <td>
-                  <label htmlFor={`replace-${document.document_id}`}>Replace</label>{" "}
+                <td className="row-actions">
+                  <label className="button button-ghost button-small" htmlFor={`replace-${document.document_id}`}>Replace</label>
                   <input
+                    className="visually-hidden"
                     id={`replace-${document.document_id}`}
                     type="file"
                     accept=".pdf,.txt,.docx"
                     disabled={activeDocumentId === document.document_id}
                     onChange={(event) => void replaceDocument(document.document_id, event)}
-                  />{" "}
-                  <button
-                    type="button"
-                    disabled={activeDocumentId === document.document_id}
-                    onClick={() => void deleteDocument(document.document_id, document.filename)}
-                  >
-                    Delete
-                  </button>
+                  />
+                  <button className="icon-button danger" aria-label={`Delete ${document.filename}`} type="button" disabled={activeDocumentId === document.document_id} onClick={() => void deleteDocument(document.document_id, document.filename)}><Icon name="trash" /></button>
                 </td>
               </tr>
             ))}
           </tbody>
-        </table>
+        </table></div>
       ) : null}
-    </main>
+      </div>
+    </AppShell>
   );
 }

@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { createClient } from "../lib/supabase/client";
+import { AppShell, Icon } from "./app-shell";
 
 type ChatSource = {
   document_id: string;
@@ -247,59 +248,56 @@ export function ChatAssistant({ initialConversationId }: { initialConversationId
   }
 
   return (
-    <main>
-      <p><Link href="/dashboard">Back to dashboard</Link></p>
-      <h1>AI Assistant</h1>
+    <AppShell title="AI Assistant" description="Ask questions grounded in your company knowledge base.">
       <div className="chat-layout">
-        <aside aria-label="Conversation history">
-          <h2>Conversation history</h2>
-          <button type="button" onClick={startNewConversation} disabled={isAsking}>New conversation</button>
+        <aside className="conversation-sidebar" aria-label="Conversation history">
+          <div className="conversation-sidebar-heading"><div><h2>Conversations</h2><p>{conversations.length ? `${conversations.length} saved` : "Your saved chats"}</p></div><button aria-label="New conversation" className="button button-primary button-small" type="button" onClick={startNewConversation} disabled={isAsking}><Icon name="plus" /> New chat</button></div>
           {conversations.length > 0 ? (
-            <ul>
+            <ul className="conversation-list">
               {conversations.map((conversation) => (
-                <li key={conversation.conversation_id}>
-                  <Link href={`/chat/${conversation.conversation_id}`}>{conversation.title}</Link>
-                  <button type="button" onClick={() => deleteConversation(conversation.conversation_id)} disabled={isAsking}>
-                    Delete
-                  </button>
+                <li className={conversationId === conversation.conversation_id ? "active" : ""} key={conversation.conversation_id}>
+                  <Link href={`/chat/${conversation.conversation_id}`}><span className="conversation-list-icon"><Icon name="spark" /></span><span className="conversation-title">{conversation.title}</span></Link>
+                  <button className="icon-button danger" aria-label={`Delete ${conversation.title}`} type="button" onClick={() => deleteConversation(conversation.conversation_id)} disabled={isAsking}><Icon name="trash" /></button>
                 </li>
               ))}
             </ul>
-          ) : <p>No conversations yet.</p>}
+          ) : <div className="empty-state compact"><div className="empty-icon"><Icon name="spark" /></div><p>No conversations yet.</p></div>}
         </aside>
-        <section aria-labelledby="chat-heading">
-          <h2 id="chat-heading">Ask the Nova AI Assistant</h2>
-          {isLoading ? <p role="status">Loading conversation…</p> : null}
+        <section className="chat-panel" aria-labelledby="chat-heading">
+          <div className="chat-panel-header"><div className="assistant-avatar"><Icon name="spark" /></div><div><h2 id="chat-heading">Nova AI Assistant</h2><p><span className="status-dot" /> Grounded in your knowledge base</p></div></div>
+          <div className="chat-body">
+          {isLoading ? <div className="loading-state" role="status"><span className="spinner" /> Loading conversation…</div> : null}
           {!isLoading && messages.length === 0 ? (
-            <p>Ask about the company&apos;s products, services, or policies and get answers based on the company knowledge base.</p>
+            <div className="chat-empty"><div className="hero-orb"><Icon name="spark" /></div><h3>How can Nova help?</h3><p>Ask about your company&apos;s products, services, or policies. Nova answers using only your approved knowledge base.</p><div className="prompt-grid"><button type="button" onClick={(event) => { const form = event.currentTarget.closest(".chat-panel")?.querySelector("textarea"); if (form instanceof HTMLTextAreaElement) { form.value = "What are our return and refund policies?"; form.focus(); } }}>What are our return policies?</button><button type="button" onClick={(event) => { const form = event.currentTarget.closest(".chat-panel")?.querySelector("textarea"); if (form instanceof HTMLTextAreaElement) { form.value = "What services does our company offer?"; form.focus(); } }}>What services do we offer?</button></div></div>
           ) : null}
           {messages.length > 0 ? (
             <ol className="chat-messages" aria-label="Conversation so far">
               {messages.map((message, index) => (
                 <li key={message.message_id ?? `${message.message_index ?? index}-${message.role}`} data-role={message.role}>
-                  <p className="chat-message-role">{message.role === "user" ? "You" : "Assistant"}</p>
-                  <p className="chat-message-answer">{message.content}</p>
+                  <div className="message-avatar">{message.role === "user" ? "You" : <Icon name="spark" />}</div><div className="message-content"><p className="chat-message-role">{message.role === "user" ? "You" : "Nova"}</p><p className="chat-message-answer">{message.content}</p>
                   {message.role === "assistant" && message.sources.length > 0 ? (
-                    <div>
-                      <p className="chat-sources-heading">Sources:</p>
+                    <div className="sources-block">
+                      <p className="chat-sources-heading"><span>Sources:</span> Knowledge references</p>
                       <ul className="chat-sources">
-                        {message.sources.map((source) => <li key={source.chunk_id}>{source.filename}</li>)}
+                        {message.sources.map((source) => <li key={source.chunk_id}><span className="source-file-icon"><Icon name="file" /></span><span><strong>{source.filename}</strong><small>Chunk {source.chunk_index + 1} · Relevant source</small></span></li>)}
                       </ul>
                     </div>
                   ) : null}
+                  </div>
                 </li>
               ))}
             </ol>
           ) : null}
-          {isAsking ? <p role="status">Finding an answer…</p> : null}
-          {error ? <p role="alert">{error}</p> : null}
+          {isAsking ? <div className="typing-indicator" role="status"><span /><span /><span /> Nova is thinking</div> : null}
+          {error ? <div className="alert alert-error" role="alert">{error}</div> : null}
+          </div>
           <form className="chat-form" onSubmit={askQuestion}>
             <label htmlFor="chat-question">Your question</label>
-            <textarea id="chat-question" name="question" rows={3} required disabled={isAsking} placeholder="e.g. How many days do I have to return a product." />
-            <button type="submit" disabled={isAsking}>{isAsking ? "Sending…" : "Send"}</button>
+            <textarea id="chat-question" name="question" rows={2} required disabled={isAsking} placeholder="Ask Nova anything about your company..." />
+            <button type="submit" className="button button-primary" disabled={isAsking}>{isAsking ? "Sending…" : "Send"} <Icon name="arrow" /></button>
           </form>
         </section>
       </div>
-    </main>
+    </AppShell>
   );
 }
